@@ -130,11 +130,11 @@ kubectl patch redpanda redpanda -n redpanda --type merge \
 ### Step 5b: Create a NodePool
 
 ```yaml
-# nodepool-pool1.yaml
+# nodepool-blue.yaml
 apiVersion: cluster.redpanda.com/v1alpha2
 kind: NodePool
 metadata:
-  name: pool1
+  name: blue
   namespace: redpanda
 spec:
   clusterRef:
@@ -143,7 +143,7 @@ spec:
 ```
 
 ```bash
-kubectl apply -f nodepool-pool1.yaml
+kubectl apply -f nodepool-blue.yaml
 ```
 
 Wait for the NodePool StatefulSet to be ready:
@@ -158,35 +158,35 @@ kubectl wait --for=condition=Stable redpanda/redpanda -n redpanda --timeout=300s
 # Check NodePool status
 kubectl get nodepool -n redpanda
 
-# Check pods — should see redpanda-pool1-{0,1,2}
+# Check pods — should see redpanda-blue-{0,1,2}
 kubectl get pods -n redpanda -l app.kubernetes.io/name=redpanda
 
 # Check broker health
-kubectl exec -n redpanda redpanda-pool1-0 -c redpanda -- rpk cluster health
-kubectl exec -n redpanda redpanda-pool1-0 -c redpanda -- rpk redpanda admin brokers list
+kubectl exec -n redpanda redpanda-blue-0 -c redpanda -- rpk cluster health
+kubectl exec -n redpanda redpanda-blue-0 -c redpanda -- rpk redpanda admin brokers list
 ```
 
-Expected output: 3 brokers from pool1, all active and healthy. NodePool conditions show `Bound=True`, `Deployed=True`, `Stable=True`.
+Expected output: 3 brokers from the blue pool, all active and healthy. NodePool conditions show `Bound=True`, `Deployed=True`, `Stable=True`.
 
 > **Note:** Recreate your test topic after migration since this creates a new cluster:
 > ```bash
-> kubectl exec -n redpanda redpanda-pool1-0 -c redpanda -- rpk topic create test-topic -p 6 -r 3
-> kubectl exec -n redpanda redpanda-pool1-0 -c redpanda -- \
->   bash -c 'for i in $(seq 1 20); do echo "msg-$i"; done | rpk topic produce test-topic'
+> kubectl exec -n redpanda redpanda-blue-0 -c redpanda -- rpk topic create test-topic -p 6 -r 3
+> kubectl exec -n redpanda redpanda-blue-0 -c redpanda -- \
+>   bash -c 'for i in $(seq 1 50); do echo "msg-$i"; done | rpk topic produce test-topic'
 > ```
 
 ## 6. Upgrade Redpanda via Blue/Green NodePool Migration
 
-NodePools enable blue/green upgrades: bring up a new pool on the target version, let partitions replicate, then decommission the old pool. No in-place rolling restart needed.
+NodePools enable blue/green upgrades: bring up a new pool (green) on the target version, wait for all brokers to be healthy, then delete the old pool (blue). The operator decommissions the old brokers one by one automatically, draining partitions to the green brokers. No in-place rolling restart needed.
 
-### Step 6a: Create pool2 with the New Version
+### Step 6a: Create the Green Pool with the New Version
 
 ```yaml
-# nodepool-pool2.yaml
+# nodepool-green.yaml
 apiVersion: cluster.redpanda.com/v1alpha2
 kind: NodePool
 metadata:
-  name: pool2
+  name: green
   namespace: redpanda
 spec:
   clusterRef:
@@ -197,7 +197,7 @@ spec:
 ```
 
 ```bash
-kubectl apply -f nodepool-pool2.yaml
+kubectl apply -f nodepool-green.yaml
 ```
 
 Wait for both pools to be healthy (6 brokers temporarily):
@@ -206,49 +206,36 @@ Wait for both pools to be healthy (6 brokers temporarily):
 kubectl wait --for=condition=Healthy redpanda/redpanda -n redpanda --timeout=300s
 ```
 
-Verify 6 brokers are active:
+Verify all 6 brokers are active:
 
 ```bash
-kubectl exec -n redpanda redpanda-pool1-0 -c redpanda -- rpk redpanda admin brokers list
+kubectl exec -n redpanda redpanda-blue-0 -c redpanda -- rpk redpanda admin brokers list
+kubectl exec -n redpanda redpanda-blue-0 -c redpanda -- rpk cluster health
 ```
 
-### Step 6b: Decommission pool1
+### Step 6b: Delete the Blue Pool
 
-Scale pool1 to 0 replicas. The operator decommissions each broker one by one, draining partitions to the pool2 brokers:
+Delete the old NodePool. The operator decommissions each blue broker one at a time internally, draining partitions to the green brokers before removing each one:
 
 ```bash
-kubectl patch nodepool pool1 -n redpanda --type merge -p '{"spec":{"replicas":0}}'
+kubectl delete nodepool blue -n redpanda
 ```
 
-Monitor decommission progress:
-
-```bash
-# Watch broker membership status
-kubectl exec -n redpanda redpanda-pool2-0 -c redpanda -- rpk redpanda admin brokers list
-
-# Check individual broker decommission progress
-kubectl exec -n redpanda redpanda-pool2-0 -c redpanda -- \
-  rpk redpanda admin brokers decommission-status <broker-id>
-```
-
-Wait for full decommission:
+Wait for the decommission to complete:
 
 ```bash
 kubectl wait --for=condition=Stable redpanda/redpanda -n redpanda --timeout=600s
 ```
 
-### Step 6c: Verify and Clean Up
+### Step 6c: Verify
 
 ```bash
-# Only pool2 brokers should remain
-kubectl exec -n redpanda redpanda-pool2-0 -c redpanda -- rpk redpanda admin brokers list
-kubectl exec -n redpanda redpanda-pool2-0 -c redpanda -- rpk cluster health
+# Only green brokers should remain
+kubectl exec -n redpanda redpanda-green-0 -c redpanda -- rpk redpanda admin brokers list
+kubectl exec -n redpanda redpanda-green-0 -c redpanda -- rpk cluster health
 
 # Verify data survived the migration
-kubectl exec -n redpanda redpanda-pool2-0 -c redpanda -- rpk topic consume test-topic -n 5
-
-# Delete the empty pool1
-kubectl delete nodepool pool1 -n redpanda
+kubectl exec -n redpanda redpanda-green-0 -c redpanda -- rpk topic consume test-topic -n 5
 ```
 
 ## 7. (Optional) Remove NodePools — Return to Redpanda CR Management
@@ -270,10 +257,10 @@ Wait for the new brokers to join and become healthy:
 kubectl wait --for=condition=Healthy redpanda/redpanda -n redpanda --timeout=300s
 ```
 
-### Step 7b: Decommission the NodePool
+### Step 7b: Delete the NodePool
 
 ```bash
-kubectl patch nodepool pool2 -n redpanda --type merge -p '{"spec":{"replicas":0}}'
+kubectl delete nodepool green -n redpanda
 kubectl wait --for=condition=Stable redpanda/redpanda -n redpanda --timeout=600s
 ```
 
@@ -289,7 +276,7 @@ kubectl exec -n redpanda redpanda-0 -c redpanda -- rpk cluster health
 kubectl exec -n redpanda redpanda-0 -c redpanda -- rpk topic consume test-topic -n 5
 
 # Delete the empty NodePool
-kubectl delete nodepool pool2 -n redpanda
+kubectl delete nodepool green -n redpanda
 ```
 
 ## Test Results
@@ -311,35 +298,35 @@ All tests performed on kind v0.31.0, Kubernetes v1.35.0, Redpanda Operator v26.1
 |-------|--------|-------|
 | `replicas: 0` accepted | PASS | |
 | Old StatefulSet scales to 0 | PASS | Brokers terminated — this is destructive, not a live migration |
-| NodePool creates new StatefulSet | PASS | Named `redpanda-pool1` |
-| pool1 pods `redpanda-pool1-{0,1,2}` running | PASS | |
+| NodePool creates new StatefulSet | PASS | Named `redpanda-blue` |
+| Blue pool pods `redpanda-blue-{0,1,2}` running | PASS | |
 | NodePool conditions (Bound, Deployed, Stable) | PASS | |
 | Data from original cluster preserved | **FAIL** | Setting `replicas: 0` terminates old brokers before NodePool is ready. This is a fresh cluster, not a live migration. |
-| All 3 pool1 brokers in Raft cluster | **PARTIAL** | In some runs, only 2/3 brokers join due to broker ID collision with decommissioned IDs from the old StatefulSet |
+| All 3 blue pool brokers in Raft cluster | **PARTIAL** | In some runs, only 2/3 brokers join due to broker ID collision with decommissioned IDs from the old StatefulSet |
 
 **Key finding:** The migration path (set `replicas: 0` then create NodePool) does NOT perform a live migration. The old StatefulSet is scaled down, brokers are terminated, and the NodePool creates an entirely new cluster. Pre-existing data is lost. For production use, consider creating the NodePool first and migrating data before scaling down.
 
-### Test 3: Blue/Green Upgrade via NodePools
+### Test 3: Blue/Green Upgrade via NodePools (delete old NodePool)
 
 | Check | Result | Notes |
 |-------|--------|-------|
-| Create pool2 (v26.1.2) alongside pool1 | PASS | 6 brokers running simultaneously |
-| All 6 brokers join Raft cluster | PASS | |
-| Scale pool1 to 0 | PASS | Operator decommissions brokers one by one |
-| Decommission completes | PASS | Required deleting a stuck leaderless partition in one run |
-| Only pool2 brokers remain | PASS | 3 brokers, all on v26.1.2 |
-| Cluster healthy after migration | PASS | |
-| Data survived migration | PASS | Topic data intact and consumable |
+| Create green pool (v26.1.2) alongside blue pool | PASS | 6 brokers running simultaneously |
+| All 6 brokers join Raft cluster | PASS | Zero leaderless or under-replicated partitions |
+| Delete blue NodePool | PASS | Operator decommissions blue brokers one by one internally |
+| Decommission completes without intervention | PASS | No leaderless partitions, no stalls |
+| Only green brokers remain | PASS | 3 brokers, all on v26.1.2 |
+| Cluster healthy throughout | PASS | |
+| Data (50 messages, RF=3) survived | PASS | All messages consumable after migration |
 
-**Key finding:** The blue/green pattern works well. The operator handles decommission automatically when scaling a pool to 0. In one test run, a leaderless partition (`kafka/upgrade-test/1`) stalled decommission progress — the sidecar readiness probe failed because the partition was leaderless, creating a circular dependency. Deleting and recreating the topic resolved the issue.
+**Key finding:** Deleting the old NodePool is the cleanest upgrade path. The operator handles the decommission internally — it drains partitions from each blue broker to the green brokers one at a time before removing it. No leaderless partitions occurred, no manual intervention needed, data fully preserved.
 
 ### Test 4: Remove NodePools — Return to Redpanda CR
 
 | Check | Result | Notes |
 |-------|--------|-------|
-| Set `replicas: 3` on Redpanda CR | PASS | 3 new CR-managed brokers join alongside pool2 |
+| Set `replicas: 3` on Redpanda CR | PASS | 3 new CR-managed brokers join alongside green pool |
 | 6 brokers running simultaneously | PASS | |
-| Scale pool2 to 0 | PASS | Operator decommissions pool2 brokers |
+| Delete green NodePool | PASS | Operator decommissions green brokers |
 | Decommission completes | PASS | |
 | Only `redpanda-{0,1,2}` remain | PASS | |
 | Cluster healthy | PASS | |
@@ -349,13 +336,13 @@ All tests performed on kind v0.31.0, Kubernetes v1.35.0, Redpanda Operator v26.1
 
 ## Known Issues and Gotchas
 
-1. **Migration is destructive, not live.** Setting `statefulset.replicas: 0` terminates old brokers immediately. The NodePool creates a fresh cluster, not an adoption of existing brokers. Plan accordingly for production migrations.
+1. **Delete the old NodePool for blue/green upgrades.** The cleanest decommission path is `kubectl delete nodepool <old-pool>`. The operator drains partitions from each broker one at a time internally before removing it. This worked without leaderless partitions or manual intervention in testing.
 
-2. **NodePool image vs Redpanda CR image.** The NodePool does not inherit `spec.clusterSpec.image.tag` from the Redpanda CR. You must set `spec.image.tag` on the NodePool explicitly. If not specified, the operator uses its own default image version.
+2. **Migration from Redpanda CR is destructive, not live.** Setting `statefulset.replicas: 0` terminates old brokers immediately. The NodePool creates a fresh cluster, not an adoption of existing brokers. Plan accordingly for production migrations.
 
-3. **Broker ID collision.** When migrating from an existing cluster, new NodePool brokers may reuse broker IDs from the recently decommissioned old brokers, causing the new broker to be immediately decommissioned. This resolves over subsequent reconciliation cycles but can temporarily result in fewer active brokers than expected.
+3. **NodePool image vs Redpanda CR image.** The NodePool does not inherit `spec.clusterSpec.image.tag` from the Redpanda CR. You must set `spec.image.tag` on the NodePool explicitly. If not specified, the operator uses its own default image version.
 
-4. **Leaderless partition stall.** During decommission, if a partition move target broker has a non-ready sidecar (due to the same leaderless partition), a circular dependency can stall progress. Workaround: delete and recreate the affected topic, or use `rpk redpanda admin brokers recommission` to cancel the decommission and retry.
+4. **Broker ID collision.** When migrating from an existing cluster, new NodePool brokers may reuse broker IDs from the recently decommissioned old brokers, causing the new broker to be immediately decommissioned. This resolves over subsequent reconciliation cycles but can temporarily result in fewer active brokers than expected.
 
 5. **`OnDelete` StatefulSet update strategy.** NodePool StatefulSets use `OnDelete` update strategy. The operator manages rolling restarts directly — changing `spec.image.tag` on an existing NodePool does NOT trigger an in-place upgrade. Use the blue/green pattern (new pool) instead.
 
