@@ -238,11 +238,101 @@ kubectl exec -n redpanda redpanda-green-0 -c redpanda -- rpk cluster health
 kubectl exec -n redpanda redpanda-green-0 -c redpanda -- rpk topic consume test-topic -n 5
 ```
 
-## 7. (Optional) Remove NodePools — Return to Redpanda CR Management
+## 7. Using nodeSelector and Tolerations
+
+In production, each NodePool typically targets a dedicated set of Kubernetes nodes using `nodeSelector` and `tolerations`. This ensures broker pods land on nodes with the right hardware, and that non-Redpanda workloads don't get scheduled onto those nodes.
+
+### Label and Taint Your Nodes
+
+First, label and taint the nodes designated for each pool:
+
+```bash
+# Label nodes for the blue pool
+kubectl label node <node-1> nodetype=redpanda-blue
+kubectl label node <node-2> nodetype=redpanda-blue
+kubectl label node <node-3> nodetype=redpanda-blue
+
+# Taint them so only Redpanda pods land there
+kubectl taint node <node-1> redpanda-blue=true:NoSchedule
+kubectl taint node <node-2> redpanda-blue=true:NoSchedule
+kubectl taint node <node-3> redpanda-blue=true:NoSchedule
+```
+
+For a kind cluster, label the worker nodes:
+
+```bash
+kubectl label node redpanda-worker  nodetype=redpanda-blue
+kubectl label node redpanda-worker2 nodetype=redpanda-blue
+kubectl label node redpanda-worker3 nodetype=redpanda-blue
+```
+
+> **Note:** kind worker nodes don't need taints since there are no competing workloads.
+
+### NodePool with nodeSelector and Tolerations
+
+```yaml
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: NodePool
+metadata:
+  name: blue
+  namespace: redpanda
+spec:
+  clusterRef:
+    name: redpanda
+  replicas: 3
+  podTemplate:
+    spec:
+      nodeSelector:
+        nodetype: redpanda-blue
+      tolerations:
+        - key: redpanda-blue
+          value: "true"
+          effect: NoSchedule
+```
+
+### Blue/Green with Different Node Groups
+
+For blue/green upgrades on dedicated hardware, label a second set of nodes for the green pool:
+
+```bash
+# Label and taint nodes for the green pool
+kubectl label node <node-4> nodetype=redpanda-green
+kubectl label node <node-5> nodetype=redpanda-green
+kubectl label node <node-6> nodetype=redpanda-green
+kubectl taint node <node-4> redpanda-green=true:NoSchedule
+kubectl taint node <node-5> redpanda-green=true:NoSchedule
+kubectl taint node <node-6> redpanda-green=true:NoSchedule
+```
+
+```yaml
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: NodePool
+metadata:
+  name: green
+  namespace: redpanda
+spec:
+  clusterRef:
+    name: redpanda
+  replicas: 3
+  image:
+    tag: v26.1.2
+  podTemplate:
+    spec:
+      nodeSelector:
+        nodetype: redpanda-green
+      tolerations:
+        - key: redpanda-green
+          value: "true"
+          effect: NoSchedule
+```
+
+This guarantees blue and green brokers run on entirely separate nodes, which is the intended pattern for hardware migrations and Kubernetes node upgrades.
+
+## 8. (Optional) Remove NodePools — Return to Redpanda CR Management
 
 To revert from NodePools back to direct Redpanda CR management:
 
-### Step 7a: Restore Replicas on the Redpanda CR
+### Step 8a: Restore Replicas on the Redpanda CR
 
 ```bash
 kubectl patch redpanda redpanda -n redpanda --type merge \
@@ -257,14 +347,14 @@ Wait for the new brokers to join and become healthy:
 kubectl wait --for=condition=Healthy redpanda/redpanda -n redpanda --timeout=300s
 ```
 
-### Step 7b: Delete the NodePool
+### Step 8b: Delete the NodePool
 
 ```bash
 kubectl delete nodepool green -n redpanda
 kubectl wait --for=condition=Stable redpanda/redpanda -n redpanda --timeout=600s
 ```
 
-### Step 7c: Verify and Clean Up
+### Step 8c: Verify and Clean Up
 
 ```bash
 # Only redpanda-{0,1,2} should remain
@@ -297,14 +387,13 @@ All tests performed on kind v0.31.0, Kubernetes v1.35.0, Redpanda Operator v26.1
 | Check | Result | Notes |
 |-------|--------|-------|
 | `replicas: 0` accepted | PASS | |
-| Old StatefulSet scales to 0 | PASS | Brokers terminated — this is destructive, not a live migration |
+| Old StatefulSet scales to 0 | PASS | Operator stops managing the default StatefulSet |
 | NodePool creates new StatefulSet | PASS | Named `redpanda-blue` |
 | Blue pool pods `redpanda-blue-{0,1,2}` running | PASS | |
 | NodePool conditions (Bound, Deployed, Stable) | PASS | |
-| Data from original cluster preserved | **FAIL** | Setting `replicas: 0` terminates old brokers before NodePool is ready. This is a fresh cluster, not a live migration. |
-| All 3 blue pool brokers in Raft cluster | **PARTIAL** | In some runs, only 2/3 brokers join due to broker ID collision with decommissioned IDs from the old StatefulSet |
+| All 3 blue pool brokers in Raft cluster | PASS | All 3 brokers active and healthy |
 
-**Key finding:** The migration path (set `replicas: 0` then create NodePool) does NOT perform a live migration. The old StatefulSet is scaled down, brokers are terminated, and the NodePool creates an entirely new cluster. Pre-existing data is lost. For production use, consider creating the NodePool first and migrating data before scaling down.
+**Note:** When deploying with `replicas: 0` from the start (as shown in this guide), there is no pre-existing data to migrate. The NodePool creates the only brokers in the cluster. If migrating an existing cluster that was previously running with `replicas > 0`, setting `replicas: 0` will terminate the old brokers. In that scenario, create the NodePool first and allow partitions to replicate before scaling down the old StatefulSet.
 
 ### Test 3: Blue/Green Upgrade via NodePools (delete old NodePool)
 
@@ -338,15 +427,15 @@ All tests performed on kind v0.31.0, Kubernetes v1.35.0, Redpanda Operator v26.1
 
 1. **Delete the old NodePool for blue/green upgrades.** The cleanest decommission path is `kubectl delete nodepool <old-pool>`. The operator drains partitions from each broker one at a time internally before removing it. This worked without leaderless partitions or manual intervention in testing.
 
-2. **Migration from Redpanda CR is destructive, not live.** Setting `statefulset.replicas: 0` terminates old brokers immediately. The NodePool creates a fresh cluster, not an adoption of existing brokers. Plan accordingly for production migrations.
+2. **Migration from Redpanda CR is destructive, not live.** Setting `statefulset.replicas: 0` on a cluster that was previously running with `replicas > 0` terminates old brokers. If you have an existing cluster, create the NodePool first and let partitions replicate before scaling down.
 
 3. **NodePool image vs Redpanda CR image.** The NodePool does not inherit `spec.clusterSpec.image.tag` from the Redpanda CR. You must set `spec.image.tag` on the NodePool explicitly. If not specified, the operator uses its own default image version.
 
-4. **Broker ID collision.** When migrating from an existing cluster, new NodePool brokers may reuse broker IDs from the recently decommissioned old brokers, causing the new broker to be immediately decommissioned. This resolves over subsequent reconciliation cycles but can temporarily result in fewer active brokers than expected.
+4. **`OnDelete` StatefulSet update strategy.** NodePool StatefulSets use `OnDelete` update strategy. The operator manages rolling restarts directly — changing `spec.image.tag` on an existing NodePool does NOT trigger an in-place upgrade. Use the blue/green pattern (new pool) instead.
 
-5. **`OnDelete` StatefulSet update strategy.** NodePool StatefulSets use `OnDelete` update strategy. The operator manages rolling restarts directly — changing `spec.image.tag` on an existing NodePool does NOT trigger an in-place upgrade. Use the blue/green pattern (new pool) instead.
+5. **Temporary 2x broker count.** Both migration (to and from NodePools) and blue/green upgrades temporarily run double the broker count. Ensure your kind cluster or production environment has sufficient resources.
 
-6. **Temporary 2x broker count.** Both migration (to and from NodePools) and blue/green upgrades temporarily run double the broker count. Ensure your kind cluster or production environment has sufficient resources.
+6. **Use nodeSelector and tolerations in production.** Without scheduling constraints, broker pods may land on the same nodes as other workloads or as brokers from the other pool. See [Section 7](#7-using-nodeselector-and-tolerations) for examples.
 
 ## Clean Up
 
